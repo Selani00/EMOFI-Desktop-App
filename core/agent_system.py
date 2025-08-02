@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field
 load_dotenv()
 
 API_KEY = os.getenv("DEEPSEEK_API_KEY")
+QWEN_API_KEY = os.getenv("QWEN_API_KEY")
 
 def run_agent_system(emotions):
     initial_state = AgentState(
@@ -31,6 +32,7 @@ def run_agent_system(emotions):
         detected_task=None,
         recommendation=None,
         recommendation_options= [],
+        listofRecommendations=None,
         executed=False,
         action_executed=None,
         action_time_start=0
@@ -45,6 +47,11 @@ class AppRecommendation(BaseModel):
     search_query: str = Field(description="Search query if web-based application")
     is_local: bool = Field(default=False, description="Whether the app is a local executable")
 
+class RecommendationResponse(BaseModel):
+    recommendation: str = Field(description="4-word mood improvement suggestions")
+    recommendation_options: List[AppRecommendation] = Field(description="Two app recommendations")
+class RecommendationList(BaseModel):
+    listofRecommendations: List[RecommendationResponse] = Field(description="List of 3 recommendations with options")
 
 class AgentState(BaseModel):
     emotions: List[str]
@@ -52,17 +59,15 @@ class AgentState(BaseModel):
     detected_task: Optional[str]
     recommendation: Optional[List[str]]  # list of suggestions
     recommendation_options: Optional[List[List[AppRecommendation]]]
+    listofRecommendations: Optional[RecommendationList]
     executed: Optional[bool]
     action_executed: Optional[str]
     action_time_start: Optional[float]
 
 
-class RecommendationResponse(BaseModel):
-    recommendation: str = Field(description="4-word mood improvement suggestions")
-    recommendation_options: List[AppRecommendation] = Field(description="Two app recommendations")
 
-class RecommendationList(BaseModel):
-    listofRecommendations: List[RecommendationResponse] = Field(description="List of 3 recommendations with options")
+
+
     
 
 
@@ -271,6 +276,22 @@ def parse_llm_response(text):
         print("[Agent] Error parsing LLM response block:", e)
         return None, []
 
+def extract_json_from_text(text):
+    try:
+        # Find JSON between ```json and ```
+        match = re.search(r'```json\s*(\{.*?\}|\[.*?\])\s*```', text, re.DOTALL)
+        if match:
+            return match.group(1)
+
+        # If no code block, try to parse whole text
+        if text.strip().startswith("{") or text.strip().startswith("["):
+            return text.strip()
+
+        raise ValueError("No valid JSON found in text.")
+    except Exception as e:
+        print("[Agent] JSON extraction failed:", e)
+        return None
+    
 def recommendation_agent(state):
     if "No Need to Detect Task" in state.detected_task or not state.detected_task:
         print("[Agent] No task detected, skipping recommendation.")
@@ -339,19 +360,43 @@ def recommendation_agent(state):
         ]
     """
     try:
+        # response = requests.post(
+        #     "https://fa7a43f295fa.ngrok-free.app/api/generate",
+        #     headers={"Content-Type": "application/json"},
+        #     json={"model": "qwen3:4b", "prompt": prompt, "stream": False, "options": {"temperature": 0.2}},
+        # )
+
         response = requests.post(
-            "https://fa7a43f295fa.ngrok-free.app/api/generate",
-            headers={"Content-Type": "application/json"},
-            json={"model": "qwen3:4b", "prompt": prompt, "stream": False, "options": {"temperature": 0.2}},
-        )
+            url="https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {QWEN_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            data=json.dumps({
+                "model": "qwen/qwen-2.5-72b-instruct:free",
+                "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+                ]
+            })
+            )
+
+        print(response.json()["choices"][0]["message"])
 
         if response.status_code != 200:
             print(f"API error ({response.status_code}): {response.text[:100]}...")
             return {"recommendation": ["No action needed"], "recommendation_options": []}
 
-        raw_response = response.json()["response"]
+
+        # raw_response = response.json()["response"]
+        raw_response = response.json()["choices"][0]["message"]["content"]
         print("Raw Response:", raw_response)
-        clean_json = clean_think_tags(raw_response)
+        # clean_json = clean_think_tags(raw_response)
+
+        clean_json = extract_json_from_text(raw_response)
+                
         json_data = json.loads(clean_json)
         resp_data = RecommendationList(listofRecommendations=[
             RecommendationResponse(**item) for item in json_data
@@ -369,6 +414,11 @@ def recommendation_agent(state):
         # Update state
         state.recommendation = recommendations_list
         state.recommendation_options = recommendation_options_list
+
+        state.listofRecommendations = resp_data.listofRecommendations
+
+        print("List of Recommendations", state.listofRecommendations)
+
 
         print(f"Recommendations: {recommendations_list}")
         print(f"Recommendation options: {recommendation_options_list}")
@@ -391,12 +441,33 @@ def send_blocking_message(title, message):
     ctypes.windll.user32.MessageBoxW(0, message, title, MB_OK)
 
 def task_execution_agent(state):
+    list_of_recommendations = state.listofRecommendations
     recommended_output = state.recommendation
     recommended_options = state.recommendation_options
     print("Recommended output: ", recommended_output)
     if "No action needed" not in recommended_output:
-        status = send_notification("Recommendations by EMOFI", recommended_output)
-        if status:
+        recommendations_dict = [
+            {
+                "recommendation": r.recommendation,
+                "recommendation_options": [
+                    {
+                        "app_name": opt.app_name,
+                        "app_url": opt.app_url,
+                        "search_query": opt.search_query,
+                        "is_local": opt.is_local
+                    }
+                    for opt in r.recommendation_options
+                ]
+            }
+            for r in list_of_recommendations
+        ]
+
+        chosen_recommendation = send_notification("Recommendations by EMOFI", recommendations_dict)
+
+        # chosen_recommendation = send_notification("Recommendations by EMOFI", list_of_recommendations)
+        print("Chosen recommendation: ", chosen_recommendation)
+        if chosen_recommendation:
+            # find the recommended option that matches the chosen recommendation
             #selected_option = selection_window(recommended_options)
             window, app = launch_window(recommended_options)  # implement suggestions tray simple ui as a drawer from right corner
             app.exec()
