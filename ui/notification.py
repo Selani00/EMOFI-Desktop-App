@@ -1,3 +1,4 @@
+from typing import List
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 import win32api
@@ -8,10 +9,8 @@ import webbrowser
 from win11toast import toast
 import os
 import threading
-
 icon_path = r'D:\RuhunaNew\Academic\Research\Facial_Recog_Repo\Group_50_Repo\DesktopApp\assets\res\Icon.jpg'
 executer_path = r'executer.pyw'
-
 import tkinter as tk
 import os
 import ctypes
@@ -59,10 +58,8 @@ import ctypes
 #     root.mainloop()
 #     return user_choice["value"]
 
-def send_notification(title, list_of_recommendations, timeout=None):
+def send_notification(title, recommendations_list, timeout=None):
     selected_app = {"value": None}
-
-    print("List of recommendation", list_of_recommendations)
 
     def show_options(options):
         for widget in frame.winfo_children():
@@ -71,26 +68,26 @@ def send_notification(title, list_of_recommendations, timeout=None):
         tk.Label(frame, text="Choose an app:", bg="#2b2b2b", fg="white", font=("Segoe UI", 10)).pack(pady=(0, 10))
 
         for option in options:
-            btn = tk.Button(frame, text=option["app_name"], width=25, bg="#3c3f41", fg="white", font=("Segoe UI", 9),
+            btn = tk.Button(frame, text=option.app_name, width=25, bg="#3c3f41", fg="white", font=("Segoe UI", 9),
                             relief="flat", highlightthickness=0, command=lambda opt=option: select_app(opt))
             btn.pack(pady=3)
 
     def select_recommendation(rec):
-        show_options(rec["recommendation_options"])
+        show_options(rec.recommendation_options)
 
     def select_app(option):
         selected_app["value"] = {
-            "app_name": option["app_name"],
-            "app_url": option["app_url"],
-            "search_query": option["search_query"],
-            "is_local": option["is_local"]
+            "app_name": option.app_name,
+            "app_url": option.app_url,
+            "search_query": option.search_query,
+            "is_local": option.is_local
         }
         root.destroy()
 
     # Create the main window
     root = tk.Tk()
     root.title(title)
-    root.overrideredirect(True)  # Remove window border
+    root.overrideredirect(True)
     root.attributes("-topmost", True)
     root.configure(bg="#2b2b2b")
 
@@ -110,7 +107,7 @@ def send_notification(title, list_of_recommendations, timeout=None):
 
     # Step 1: Show recommendation choices
     for rec in list_of_recommendations:
-        btn = tk.Button(frame, text=rec["recommendation"], width=25, bg="#3c3f41", fg="white", font=("Segoe UI", 9),
+        btn = tk.Button(frame, text=rec.recommendation, width=25, bg="#3c3f41", fg="white", font=("Segoe UI", 9),
                         relief="flat", highlightthickness=0, command=lambda r=rec: select_recommendation(r))
         btn.pack(pady=3)
 

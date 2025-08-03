@@ -18,4 +18,5 @@ dist
 build
 Setups
 *.pyc
-# .env
+.env
+*.db

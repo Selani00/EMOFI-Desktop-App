@@ -65,13 +65,6 @@ class AgentState(BaseModel):
     action_time_start: Optional[float]
 
 
-
-
-
-    
-
-
-
 def create_workflow():
     workflow = StateGraph(AgentState)
     workflow.add_node("calculate_emotion", average_emotion_agent)
@@ -159,6 +152,219 @@ def task_detection_agent(state):
         print(f"Error detecting task: {str(e)}")
         return {"detected_task": "unknown"}
     
+
+
+def parse_llm_response(text):
+    try:
+        # Clean <think> tags if present
+        text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+
+        # Extract recommendation
+        rec_match = re.search(r'recommendation:\s*(.+)', text)
+        recommendation = rec_match.group(1).strip() if rec_match else None
+
+        # Extract recommendation_options (raw list inside [])
+        options_match = re.search(r'recommendation_options:\s*\[(.*)\]', text, re.DOTALL)
+        options_raw = options_match.group(1).strip() if options_match else ""
+
+        # Convert (app_name: 'X', ...) → {"app_name": "X", ...}
+        options = []
+        for option_text in re.findall(r'\((.*?)\)', options_raw, re.DOTALL):
+            entry = {}
+            for kv in option_text.split(','):
+                key, val = kv.split(':', 1)
+                entry[key.strip()] = val.strip().strip("'\"")
+            options.append(entry)
+
+        return recommendation, options
+
+    except Exception as e:
+        print("[Agent] Error parsing LLM response block:", e)
+        return None, []
+
+def extract_json_from_text(text):
+    try:
+        # Find JSON between ```json and ```
+        match = re.search(r'```json\s*(\{.*?\}|\[.*?\])\s*```', text, re.DOTALL)
+        if match:
+            return match.group(1)
+
+        # If no code block, try to parse whole text
+        if text.strip().startswith("{") or text.strip().startswith("["):
+            return text.strip()
+
+        raise ValueError("No valid JSON found in text.")
+    except Exception as e:
+        print("[Agent] JSON extraction failed:", e)
+        return None
+    
+def recommendation_agent(state):
+    if not state.detected_task or "No Need to Detect Task" in state.detected_task:
+        print("[Agent] No task detected – skipping recommendation.")
+        return {"recommendation": ["No action needed"], "recommendation_options": []}
+
+    emotion = state.average_emotion
+    task = state.detected_task
+    print(f"[Agent] Processing for emotion={emotion!r}, task={task!r}")
+
+    negative_emotions = ["Angry", "Sad", "Fear", "Disgust", "Stress", "Boring"]
+    if emotion not in negative_emotions:
+        print("[Agent] Mood is fine – no recommendation.")
+        return {"recommendation": ["No action needed"], "recommendation_options": []}
+
+    conn = get_connection()
+    if not conn:
+        print("[Agent] DB connection failed – skip recommendation.")
+        return {"recommendation": ["No action needed"], "recommendation_options": []}
+
+    available_apps = get_apps_by_emotion(conn, emotion)
+    print("[Agent] Available apps:", available_apps)
+    prompt = f"""
+            User feels {emotion} while working on: {task}.
+            Looking for 3 four-word mood-improvement suggestions.
+
+            Installed apps (category|name|path):
+            {available_apps!r}
+
+            Return ONLY valid JSON. No text, no notes. Output must be an array of 3 objects:
+            - recommendation: exactly four words
+            - recommendation_options: array of 2 items each with:
+                app_name (str),
+                app_url (URL or local path),
+                search_query (str, only for web apps),
+                is_local (bool)
+            No duplicates, prefer web apps. All URLs must start with "https://". Each local app sets `is_local: true`.
+            """
+
+    full_schema = RecommendationList.model_json_schema()
+
+    try:
+        res = requests.post(
+            url="https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {QWEN_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            data=json.dumps({
+                "model": "qwen/qwen-2.5-72b-instruct:free",
+                "messages": [
+                    {"role": "system", "content": "You are an assistant. Output must be valid JSON only."},
+                    {"role": "user", "content": prompt}
+                ],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "recommendation_list",
+                        "strict": True,
+                        "schema": full_schema
+                    }
+                },
+                "structured_outputs": True
+            }
+        ))
+        print("[Agent] API response:", res.json())
+        if res.status_code != 200:
+            print(f"[Agent] API returned status {res.status_code}: {res.text[:200]}")
+            return {"recommendation": ["No action needed"], "recommendation_options": []}
+
+        raw_content = res.json()["choices"][0]["message"]["content"]
+        print("Raw Response Content:", raw_content)
+
+        try:
+            parsed_data = json.loads(raw_content) if isinstance(raw_content, str) else raw_content
+        except json.JSONDecodeError:
+            print("[Agent] Failed to decode JSON.")
+            return {"recommendation": ["No action needed"], "recommendation_options": []}
+
+        if "listofRecommendations" not in parsed_data or not isinstance(parsed_data["listofRecommendations"], list):
+            print("[Agent] Parsed data is not a valid list of dicts.")
+            return {"recommendation": ["No action needed"], "recommendation_options": []}
+
+        try:
+            recommendation_objects = [RecommendationResponse(**item) for item in parsed_data["listofRecommendations"]]
+        except Exception as e:
+            print("[Agent] Exception parsing recommendation objects:", e)
+            return {"recommendation": ["No action needed"], "recommendation_options": []}
+
+        resp_data = RecommendationList(listofRecommendations=recommendation_objects)
+
+        # Extract recommendations
+        recommendations_list = [rec.recommendation for rec in resp_data.listofRecommendations]
+        recommendation_options_list = [rec.recommendation_options for rec in resp_data.listofRecommendations]
+
+        print("Final Recommendations:", recommendations_list)
+        print("Options:", recommendation_options_list)
+        print("List of Recommendations:", resp_data.listofRecommendations)
+        
+        
+        # Update state
+        state.recommendation = recommendations_list
+        state.recommendation_options = recommendation_options_list
+        state.listofRecommendations = resp_data
+
+        return {
+            "recommendation": recommendations_list,
+            "recommendation_options": recommendation_options_list
+        }
+
+    except Exception as e:
+        print("[Agent] Unexpected error:", e)
+        return {
+            "recommendation": ["No action needed"],
+            "recommendation_options": [],
+            "listofRecommendations": RecommendationList(listofRecommendations=[])
+        }
+
+
+
+def send_blocking_message(title, message):
+    MB_OK = 0x0
+    ctypes.windll.user32.MessageBoxW(0, message, title, MB_OK)
+
+def task_execution_agent(state):
+    recommended_output = state.recommendation
+    recommended_options = state.recommendation_options
+    if not state.listofRecommendations or not state.listofRecommendations.listofRecommendations:
+        print("[Agent] No valid recommendations available")
+        return {"executed": False}
+    
+    # Extract the actual list of recommendations
+    recommendations = state.listofRecommendations.listofRecommendations
+    print("List of Recommendations in task_execution_agent: ", recommendations)
+    if "No action needed" not in recommended_output:
+        chosen_recommendation = send_notification("Recommendations by EMOFI",recommendations)
+        print("Chosen recommendation: ", chosen_recommendation)
+        if chosen_recommendation:
+            # find the recommended option that matches the chosen recommendation
+            #selected_option = selection_window(recommended_options)
+            window, app = launch_window(recommended_options)  # implement suggestions tray simple ui as a drawer from right corner
+            app.exec()
+            selected_option = window.selectedChoice
+            window.close()
+            app.quit()
+
+            print("selected option: ", selected_option)
+            if selected_option:
+                start_time = time.time()
+                open_recommendation(selected_option) # Execute the task based on the option
+                print("Task is executed")
+                return {
+                    "executed": True,
+                    "action_time_start": start_time
+                }
+                    
+def task_exit_agent(state):
+    task_executed = True
+    if not state.executed:
+        return {"executed": False, "action_time_start": None}
+    print("Thread is running")
+    while task_executed:
+        time.sleep(35)
+        task_executed = False
+    print("Thread is closed")
+
+    return {"executed": False, "action_time_start": None}
+
 
 # def recommendation_agent(state):
 #     # Early exit if no task detected
@@ -248,253 +454,3 @@ def task_detection_agent(state):
 #     # This line runs only after user presses OK in the message box
 #     execute_task(recommendation)
 #     return {"executed": True}
-def parse_llm_response(text):
-    try:
-        # Clean <think> tags if present
-        text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
-
-        # Extract recommendation
-        rec_match = re.search(r'recommendation:\s*(.+)', text)
-        recommendation = rec_match.group(1).strip() if rec_match else None
-
-        # Extract recommendation_options (raw list inside [])
-        options_match = re.search(r'recommendation_options:\s*\[(.*)\]', text, re.DOTALL)
-        options_raw = options_match.group(1).strip() if options_match else ""
-
-        # Convert (app_name: 'X', ...) → {"app_name": "X", ...}
-        options = []
-        for option_text in re.findall(r'\((.*?)\)', options_raw, re.DOTALL):
-            entry = {}
-            for kv in option_text.split(','):
-                key, val = kv.split(':', 1)
-                entry[key.strip()] = val.strip().strip("'\"")
-            options.append(entry)
-
-        return recommendation, options
-
-    except Exception as e:
-        print("[Agent] Error parsing LLM response block:", e)
-        return None, []
-
-def extract_json_from_text(text):
-    try:
-        # Find JSON between ```json and ```
-        match = re.search(r'```json\s*(\{.*?\}|\[.*?\])\s*```', text, re.DOTALL)
-        if match:
-            return match.group(1)
-
-        # If no code block, try to parse whole text
-        if text.strip().startswith("{") or text.strip().startswith("["):
-            return text.strip()
-
-        raise ValueError("No valid JSON found in text.")
-    except Exception as e:
-        print("[Agent] JSON extraction failed:", e)
-        return None
-    
-def recommendation_agent(state):
-    if "No Need to Detect Task" in state.detected_task or not state.detected_task:
-        print("[Agent] No task detected, skipping recommendation.")
-        return {"recommendation": "No action needed", "recommendation_options": []}
-
-    emotion = state.average_emotion
-    detected_task = state.detected_task
-    print(f"[Agent] Calculating recommendation for emotion: {emotion} and task: {detected_task}")
-
-    negative_emotions = ["Angry", "Sad", "Fear", "Disgust", "Stress", "Boring"]
-
-    if emotion not in negative_emotions:
-        print("You are in a good mood")
-        return {"recommendation": "No action needed", "recommendation_options": []}
-
-    conn = get_connection()
-    if not conn:
-        print("[Agent] Failed to connect to the database.")
-        return {"recommendation": "No action needed", "recommendation_options": []}
-
-    available_apps = get_apps_by_emotion(conn, emotion)
-    print("Available Apps", available_apps)
-
-    prompt = f"""
-        User is feeling {emotion} and is currently working on the screen task: {detected_task}.
-        User is looking for a way to improve mood.
-
-        Here are the locally installed apps with category, app name and their path:
-        {available_apps}
-
-        Output must be ONLY valid JSON. No text, no explanation, no tags and correct key value pairs. When selecting apps, consider:
-        1. If the app is a web-based application, use the URL as app_url.
-        2. If the app is a desktop application, use the path as the app_url.
-        3. Check the app's is matching for the recommendation.
-        4. Search query is applied only for web based applications.
-        5. Recommendation options should carry two apps , If there are no suitable local apps available,select online free applications(like youtube, online games, facebook, etc) as well.Url should be in this format: "https://xxxxxx.com".
-        6. If the app_url is local, set is_local to true, otherwise false.
-        7. Do not use the same app more than twice in the recommendations. Include web-based applications as much as you can.
-        Return the following structure:
-        [
-            {{
-                "recommendation": "<first 4-word suggestion>",
-                "recommendation_options": [
-                    {{
-                        "app_name": "<app name 1>",
-                        "app_url": "<app url or local path>",
-                        "search_query": "<search query 1>",
-                        "is_local": <true or false>
-                    }},
-                    {{
-                        "app_name": "<app name 2>",
-                        "app_url": "<app url or local path>",
-                        "search_query": "<search query 2>",
-                        "is_local": <true or false>
-                    }}
-                ]
-            }},
-            {{
-                "recommendation": "<second suggestion>",
-                "recommendation_options": [ ...same as above... ]
-            }},
-            {{
-                "recommendation": "<third suggestion>",
-                "recommendation_options": [ ...same as above... ]
-            }}
-        ]
-    """
-    try:
-        # response = requests.post(
-        #     "https://fa7a43f295fa.ngrok-free.app/api/generate",
-        #     headers={"Content-Type": "application/json"},
-        #     json={"model": "qwen3:4b", "prompt": prompt, "stream": False, "options": {"temperature": 0.2}},
-        # )
-
-        response = requests.post(
-            url="https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {QWEN_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            data=json.dumps({
-                "model": "qwen/qwen-2.5-72b-instruct:free",
-                "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-                ]
-            })
-            )
-
-        print(response.json()["choices"][0]["message"])
-
-        if response.status_code != 200:
-            print(f"API error ({response.status_code}): {response.text[:100]}...")
-            return {"recommendation": ["No action needed"], "recommendation_options": []}
-
-
-        # raw_response = response.json()["response"]
-        raw_response = response.json()["choices"][0]["message"]["content"]
-        print("Raw Response:", raw_response)
-        # clean_json = clean_think_tags(raw_response)
-
-        clean_json = extract_json_from_text(raw_response)
-                
-        json_data = json.loads(clean_json)
-        resp_data = RecommendationList(listofRecommendations=[
-            RecommendationResponse(**item) for item in json_data
-        ])
-        print("Parsed Response:", resp_data)
-
-        # Prepare lists for state
-        recommendations_list = []
-        recommendation_options_list = []
-
-        for rec in resp_data.listofRecommendations:
-            recommendations_list.append(rec.recommendation)
-            recommendation_options_list.append(rec.recommendation_options)
-
-        # Update state
-        state.recommendation = recommendations_list
-        state.recommendation_options = recommendation_options_list
-
-        state.listofRecommendations = resp_data.listofRecommendations
-
-        print("List of Recommendations", state.listofRecommendations)
-
-
-        print(f"Recommendations: {recommendations_list}")
-        print(f"Recommendation options: {recommendation_options_list}")
-
-        return {
-            "recommendation": recommendations_list,
-            "recommendation_options": recommendation_options_list
-        }
-
-    except Exception as e:
-        print("[Agent] Error parsing response:", e)
-        return {
-            "recommendation": ["No action needed"],
-            "recommendation_options": []
-        }
-
-
-def send_blocking_message(title, message):
-    MB_OK = 0x0
-    ctypes.windll.user32.MessageBoxW(0, message, title, MB_OK)
-
-def task_execution_agent(state):
-    list_of_recommendations = state.listofRecommendations
-    recommended_output = state.recommendation
-    recommended_options = state.recommendation_options
-    print("Recommended output: ", recommended_output)
-    if "No action needed" not in recommended_output:
-        recommendations_dict = [
-            {
-                "recommendation": r.recommendation,
-                "recommendation_options": [
-                    {
-                        "app_name": opt.app_name,
-                        "app_url": opt.app_url,
-                        "search_query": opt.search_query,
-                        "is_local": opt.is_local
-                    }
-                    for opt in r.recommendation_options
-                ]
-            }
-            for r in list_of_recommendations
-        ]
-
-        chosen_recommendation = send_notification("Recommendations by EMOFI", recommendations_dict)
-
-        # chosen_recommendation = send_notification("Recommendations by EMOFI", list_of_recommendations)
-        print("Chosen recommendation: ", chosen_recommendation)
-        if chosen_recommendation:
-            # find the recommended option that matches the chosen recommendation
-            #selected_option = selection_window(recommended_options)
-            window, app = launch_window(recommended_options)  # implement suggestions tray simple ui as a drawer from right corner
-            app.exec()
-            selected_option = window.selectedChoice
-            window.close()
-            app.quit()
-
-            print("selected option: ", selected_option)
-            if selected_option:
-                start_time = time.time()
-                open_recommendation(selected_option) # Execute the task based on the option
-                print("Task is executed")
-                return {
-                    "executed": True,
-                    "action_time_start": start_time
-                }
-                    
-def task_exit_agent(state):
-    task_executed = True
-    if not state.executed:
-        return {"executed": False, "action_time_start": None}
-    print("Thread is running")
-    while task_executed:
-        time.sleep(35)
-        task_executed = False
-    print("Thread is closed")
-
-    return {"executed": False, "action_time_start": None}
-
-
