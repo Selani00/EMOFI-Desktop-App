@@ -18,9 +18,5 @@ dist
 build
 Setups
 *.pyc
-<<<<<<< Updated upstream
 *.db
 *.env
-=======
-.env
->>>>>>> Stashed changes

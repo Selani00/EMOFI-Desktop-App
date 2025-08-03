@@ -14,6 +14,7 @@ from typing import List, Optional
 from pydantic import BaseModel
 from core.recommender_tools import open_recommendation
 from old_utils.runner_interface import launch_window
+from utils.tools import open_recommendations
 from database.db import get_apps_by_emotion, get_connection
 from dotenv import load_dotenv
 import os
@@ -32,7 +33,6 @@ def run_agent_system(emotions):
         detected_task=None,
         recommendation=None,
         recommendation_options= [],
-        listofRecommendations=None,
         executed=False,
         action_executed=None,
         action_time_start=0
@@ -59,7 +59,6 @@ class AgentState(BaseModel):
     detected_task: Optional[str]
     recommendation: Optional[List[str]]  # list of suggestions
     recommendation_options: Optional[List[List[AppRecommendation]]]
-    listofRecommendations: Optional[RecommendationList]
     executed: Optional[bool]
     action_executed: Optional[str]
     action_time_start: Optional[float]
@@ -246,7 +245,7 @@ def recommendation_agent(state):
         #         "Content-Type": "application/json"
         #     },
         #     data=json.dumps({
-        #         "model": "qwen/qwen-2.5-72b-instruct:free",
+        #         "model": "deepseek/deepseek-r1-0528-qwen3-8b:free",
         #         "messages": [
         #             {"role": "system", "content": "You are an assistant. Output must be valid JSON only."},
         #             {"role": "user", "content": prompt}
@@ -262,25 +261,54 @@ def recommendation_agent(state):
         #         "structured_outputs": True
         #     }
         # ))
-        
+
+        schema = {
+            "type": "object",
+                    "properties": {
+                        "listofRecommendations": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "recommendation": {"type": "string"},
+                                    "recommendation_options": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "app_name": {"type": "string"},
+                                                "app_url": {"type": "string"},
+                                                "search_query": {"type": "string"},
+                                                "is_local": {"type": "boolean"}
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+            }
+
         res = requests.post(
-            "https://087f647be26e.ngrok-free.app/api/generate",  # Use local endpoint
+             "https://fa7a43f295fa.ngrok-free.app/api/generate",  # Use local endpoint
             headers={"Content-Type": "application/json"},
             json={
                 "model": "qwen3:4b",
                 "prompt": prompt,
                 "stream": False,
                 "options": {"temperature": 0.2},
-                
+                "format": schema    
             }
         )
-        
+
+
         print("[Agent] API response:", res.json())
         if res.status_code != 200:
             print(f"[Agent] API returned status {res.status_code}: {res.text[:200]}")
             return {"recommendation": ["No action needed"], "recommendation_options": []}
 
-        raw_content = res.json()["choices"][0]["message"]["content"]
+        # raw_content = res.json()["choices"][0]["message"]["content"]
+        raw_content = res.json()["response"]
         print("Raw Response Content:", raw_content)
 
         try:
@@ -306,14 +334,11 @@ def recommendation_agent(state):
         recommendation_options_list = [rec.recommendation_options for rec in resp_data.listofRecommendations]
 
         print("Final Recommendations:", recommendations_list)
-        print("Options:", recommendation_options_list)
-        print("List of Recommendations:", resp_data.listofRecommendations)
-        
+        print("Options:", recommendation_options_list)        
         
         # Update state
         state.recommendation = recommendations_list
         state.recommendation_options = recommendation_options_list
-        state.listofRecommendations = resp_data
 
         return {
             "recommendation": recommendations_list,
@@ -337,33 +362,16 @@ def send_blocking_message(title, message):
 def task_execution_agent(state):
     recommended_output = state.recommendation
     recommended_options = state.recommendation_options
-    if not state.listofRecommendations or not state.listofRecommendations.listofRecommendations:
-        print("[Agent] No valid recommendations available")
-        return {"executed": False}
     
-    # Extract the actual list of recommendations
-    recommendations = state.listofRecommendations.listofRecommendations
-    print("List of Recommendations in task_execution_agent: ", recommendations)
+    print("List of Recommendations in task_execution_agent: ", recommended_output)
     if "No action needed" not in recommended_output:
-        chosen_recommendation = send_notification("Recommendations by EMOFI",recommendations)
+        chosen_recommendation = send_notification("Recommendations by EMOFI", recommended_output,recommended_options)
         print("Chosen recommendation: ", chosen_recommendation)
         if chosen_recommendation:
-            # find the recommended option that matches the chosen recommendation
-            #selected_option = selection_window(recommended_options)
-            window, app = launch_window(recommended_options)  # implement suggestions tray simple ui as a drawer from right corner
-            app.exec()
-            selected_option = window.selectedChoice
-            window.close()
-            app.quit()
-
-            print("selected option: ", selected_option)
-            if selected_option:
-                start_time = time.time()
-                open_recommendation(selected_option) # Execute the task based on the option
-                print("Task is executed")
-                return {
+            print("Opening recommendations...")
+            open_recommendations(chosen_recommendation)
+            return {
                     "executed": True,
-                    "action_time_start": start_time
                 }
                     
 def task_exit_agent(state):
@@ -372,10 +380,9 @@ def task_exit_agent(state):
         return {"executed": False, "action_time_start": None}
     print("Thread is running")
     while task_executed:
-        time.sleep(35)
+        time.sleep(10)
         task_executed = False
     print("Thread is closed")
-
     return {"executed": False, "action_time_start": None}
 
 
