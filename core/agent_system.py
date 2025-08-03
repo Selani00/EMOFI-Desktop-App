@@ -15,7 +15,7 @@ from pydantic import BaseModel
 from core.recommender_tools import open_recommendation
 from old_utils.runner_interface import launch_window
 from utils.tools import open_recommendations
-from database.db import get_apps_by_emotion, get_connection
+from database.db import get_apps, get_connection,add_agent_recommendations
 from dotenv import load_dotenv
 import os
 import json
@@ -216,7 +216,7 @@ def recommendation_agent(state):
         print("[Agent] DB connection failed – skip recommendation.")
         return {"recommendation": ["No action needed"], "recommendation_options": []}
 
-    available_apps = get_apps_by_emotion(conn, emotion)
+    available_apps = get_apps(conn)
     print("[Agent] Available apps:", available_apps)
     prompt = f"""
             User feels {emotion} while working on: {task}.
@@ -339,6 +339,27 @@ def recommendation_agent(state):
         # Update state
         state.recommendation = recommendations_list
         state.recommendation_options = recommendation_options_list
+
+        try:
+            for i, recommendation_type in enumerate(recommendations_list):
+                for option in recommendation_options_list[i]:
+                    recommed_app = option.app_name
+                    app_url = option.app_url
+                    search_query = option.search_query
+                    is_local = option.is_local
+
+                    add_agent_recommendations(
+                        conn,
+                        1,
+                        recommendation_type,
+                        recommed_app,
+                        app_url,
+                        search_query,
+                        is_local
+                    )
+        except Exception as e:
+            print("[Agent] Error adding recommendations to DB:", e)
+
 
         return {
             "recommendation": recommendations_list,
