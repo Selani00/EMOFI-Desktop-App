@@ -239,29 +239,42 @@ def recommendation_agent(state):
     full_schema = RecommendationList.model_json_schema()
 
     try:
+        # res = requests.post(
+        #     url="https://openrouter.ai/api/v1/chat/completions",
+        #     headers={
+        #         "Authorization": f"Bearer {QWEN_API_KEY}",
+        #         "Content-Type": "application/json"
+        #     },
+        #     data=json.dumps({
+        #         "model": "qwen/qwen-2.5-72b-instruct:free",
+        #         "messages": [
+        #             {"role": "system", "content": "You are an assistant. Output must be valid JSON only."},
+        #             {"role": "user", "content": prompt}
+        #         ],
+        #         "response_format": {
+        #             "type": "json_schema",
+        #             "json_schema": {
+        #                 "name": "recommendation_list",
+        #                 "strict": True,
+        #                 "schema": full_schema
+        #             }
+        #         },
+        #         "structured_outputs": True
+        #     }
+        # ))
+        
         res = requests.post(
-            url="https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {QWEN_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            data=json.dumps({
-                "model": "qwen/qwen-2.5-72b-instruct:free",
-                "messages": [
-                    {"role": "system", "content": "You are an assistant. Output must be valid JSON only."},
-                    {"role": "user", "content": prompt}
-                ],
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "recommendation_list",
-                        "strict": True,
-                        "schema": full_schema
-                    }
-                },
-                "structured_outputs": True
+            "https://087f647be26e.ngrok-free.app/api/generate",  # Use local endpoint
+            headers={"Content-Type": "application/json"},
+            json={
+                "model": "qwen3:4b",
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0.2},
+                
             }
-        ))
+        )
+        
         print("[Agent] API response:", res.json())
         if res.status_code != 200:
             print(f"[Agent] API returned status {res.status_code}: {res.text[:200]}")
