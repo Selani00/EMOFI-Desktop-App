@@ -12,34 +12,40 @@ import ctypes
 from collections import Counter
 from typing import List, Optional
 from pydantic import BaseModel
-from core.recommender_tools import open_recommendation
-from old_utils.runner_interface import launch_window
 from utils.tools import open_recommendations
 from database.db import get_apps, get_connection,add_agent_recommendations
 from dotenv import load_dotenv
 import os
 import json
 from pydantic import BaseModel, Field
+from winotify import Notification
+import threading
+import ctypes
+from openai import OpenAI
 
 load_dotenv()
 
 API_KEY = os.getenv("DEEPSEEK_API_KEY")
 QWEN_API_KEY = os.getenv("QWEN_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 def run_agent_system(emotions):
     initial_state = AgentState(
         emotions=emotions,
         average_emotion=None,
-        detected_task=None,
+        continue_workflow=None,
         recommendation=None,
         recommendation_options= [],
         executed=False,
         action_executed=None,
         action_time_start=0
-        
     )
     agent_workflow = create_workflow()
-    return agent_workflow.invoke(initial_state)
+    
+    # Increase recursion limit
+    config = {"recursion_limit": 100}  # Allow up to 100 steps
+    
+    return agent_workflow.invoke(initial_state, config=config)
 
 class AppRecommendation(BaseModel):
     app_name: str = Field(description="Name of recommended application")
@@ -56,28 +62,46 @@ class RecommendationList(BaseModel):
 class AgentState(BaseModel):
     emotions: List[str]
     average_emotion: Optional[str]
-    detected_task: Optional[str]
-    recommendation: Optional[List[str]]  # list of suggestions
+    continue_workflow: Optional[bool]
+    recommendation: Optional[List[str]]
     recommendation_options: Optional[List[List[AppRecommendation]]]
     executed: Optional[bool]
     action_executed: Optional[str]
     action_time_start: Optional[float]
+    open_app_handle: Optional[Any] = None
+    app_type: Optional[str] = None
+    continue_waiting: Optional[bool] = None
+    wait_start_time: Optional[float] = None  # Track when waiting began
 
 
 def create_workflow():
     workflow = StateGraph(AgentState)
     workflow.add_node("calculate_emotion", average_emotion_agent)
-    workflow.add_node("detect_task", task_detection_agent)
+    workflow.add_node("interrupt_check", interrupt_check_agent)
     workflow.add_node("generate_recommendation", recommendation_agent)
     workflow.add_node("execute_action", task_execution_agent)
+    workflow.add_node("wait_for_close", wait_for_close_agent)  # New node
     workflow.add_node("exit_action", task_exit_agent)
+    
     workflow.set_entry_point("calculate_emotion")
-    workflow.add_edge("calculate_emotion", "detect_task")
-    workflow.add_edge("detect_task", "generate_recommendation")
+    workflow.add_edge("calculate_emotion", "interrupt_check")
+    workflow.add_conditional_edges(
+        "interrupt_check",
+        lambda state: "generate_recommendation" if state.continue_workflow else END,
+    )
     workflow.add_edge("generate_recommendation", "execute_action")
-    workflow.add_edge("execute_action", "exit_action")
+    workflow.add_conditional_edges(
+        "execute_action", 
+        lambda state: "wait_for_close" if state.executed else END,
+    )
+    workflow.add_conditional_edges(
+        "wait_for_close",
+        lambda state: "wait_for_close" if state.continue_waiting else "exit_action",
+    )
     workflow.add_edge("exit_action", END)
     return workflow.compile()
+
+
 
 def average_emotion_agent(state):
     """Calculate most frequent emotion from AgentState model"""
@@ -87,6 +111,7 @@ def average_emotion_agent(state):
     counter = Counter(state.emotions)
     most_common = counter.most_common(1)[0][0]
     print(f"[Agent] Average emotion: {most_common}")
+
     return {"average_emotion": most_common}
 
 # Remove reasoning tags from the response
@@ -94,63 +119,106 @@ def clean_think_tags(text):
     cleaned_text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
     return cleaned_text.strip()
 
+# def show_notification_with_ok(title, message, duration=15):
+#     """
+#     Show Windows notification with OK button and wait for user response.
+#     Returns True if OK clicked within duration, else False.
+#     """
+#     # Create the notification
+#     toast = Notification(app_id="EMOFI", title=title, msg=message, duration="long")
 
-def task_detection_agent(state):
-    try:
-        if state.average_emotion == "Neutral" or state.average_emotion == "Happy" or state.average_emotion == "Surprise":
-            print("[Agent] No task detection needed for neutral emotion.")
-            return {"detected_task": "No Need to Detect Task"}
-        # Capture screenshot as a base64 string (possibly with prefix)
-        screenshot = capture_desktop()
-        if not screenshot:
-            raise ValueError("Failed to capture screenshot")
-        # Remove data URI prefix if present
-        if screenshot.startswith('data:image'):
-            screenshot = screenshot.split(',')[1]
+#     # Add OK button that triggers a callback (using protocol)
+#     toast.add_actions(label="OK")
 
-        # Validate base64 string (optional, for debugging)
-        try:
-            base64.b64decode(screenshot)
-        except Exception as decode_err:
-            raise ValueError(f"Invalid base64 screenshot: {decode_err}")
+#     # Show notification
+#     toast.show()
 
-        # Send the raw base64 string (no prefix) to Ollama
-        # response = ollama.generate(
-        #     model="llava:7b",
-        #     prompt="Describe user's current activity. Focus on software and tasks.",
-        #     images=[screenshot]
-        # )
-        headers = {
-            "Connection": "close",  # Disable keep-alive
-            "Content-Type": "application/json"
-        }
-        response = requests.post(
-            "https://fa7a43f295fa.ngrok-free.app/api/generate",
-            headers=headers,
-            json={
-                "model": "llava:7b",
-                "prompt": "Describe user's current activity. Focus on software and tasks.",
-                "images": [screenshot],
-                "stream": False
-            }
-        )
+#     # Wait for a certain time for the user to click (simulate by polling a flag)
+#     clicked = {"status": False}
 
-        # Handle HTTP errors
-        if response.status_code != 200:
-            print(f"API error ({response.status_code}): {response.text[:100]}...")
-            return {"detected_task": "unknown"}
+#     def monitor_click():
+#         # Simulate action URL check
+#         # Real-world: This needs a listener or log check
+#         for i in range(duration):
+#             time.sleep(1)
+#             # Here you'd check if the user clicked (through action callback or system log)
+#             # We'll simulate by checking a file or variable
+#             if clicked["status"]:
+#                 break
 
-        # Parse JSON response
-        response_data = response.json()
-        detected_task = response_data.get('response', '').strip()
-        state.detected_task = detected_task
-        print(f"Detected task: {detected_task}")
-        return {"detected_task": detected_task}
+#     # Start monitoring in a separate thread
+#     t = threading.Thread(target=monitor_click)
+#     t.start()
+#     t.join(timeout=duration)
+#     print("[Agent] User clicked OK:", clicked["status"])
 
-    except Exception as e:
-        print(f"Error detecting task: {str(e)}")
-        return {"detected_task": "unknown"}
+#     return clicked["status"]
+
+
+
+# def interrupt_check_agent(state):
+#     print("[Agent] Running interrupt_check_agent...")
+
+#     # You could base this on the emotion if you want, or always send
+#     emotion = state.average_emotion
     
+#     negative_emotions = ["Angry", "Sad", "Fear", "Disgust", "Stress", "Boring"]
+    
+#     user_response = None
+
+#     if emotion in negative_emotions:
+#         # Show notification with OK button
+#         user_response = show_notification_with_ok(
+#             title="Your Emotion Is Not Good",
+#             message="Shall we give some suggestions to boost your mood?",
+#             duration=15  # Notification auto-dismiss after 15 sec
+#         )
+
+#         if not user_response:  # If user didn't click OK in time
+#             print("[Agent] No user response, ending workflow.")
+#             # End the workflow early by setting executed=True and returning END
+#             return {"average_emotion": emotion, "executed": False} 
+#     print(f"[Agent] Emotion is {emotion}")
+
+
+#     if user_response is None or user_response == "No":
+#         print("[Agent] User declined. Ending workflow.")
+#         return {"continue_workflow": False}
+
+#     print("[Agent] User accepted. Continuing workflow.")
+#     return {"continue_workflow": True}
+    
+
+def show_notification_with_ok(title, message):
+    """Show Windows message box with OK/Cancel buttons"""
+    MB_OKCANCEL = 0x01
+    IDOK = 1
+    result = ctypes.windll.user32.MessageBoxW(0, message, title, MB_OKCANCEL)
+    return result == IDOK
+
+def interrupt_check_agent(state):
+    print("[Agent] Running interrupt_check_agent...")
+    emotion = state.average_emotion
+    negative_emotions = ["Angry", "Sad", "Fear", "Disgust", "Stress", "Boring"]
+    
+    # Always reset continue_workflow to False
+    state.continue_workflow = False
+    
+    if emotion in negative_emotions:
+        print(f"[Agent] Negative emotion detected: {emotion}")
+        # Show blocking message box
+        user_responded = show_notification_with_ok(
+            "Your Emotion Is Not Good",
+            "Shall we give some suggestions to boost your mood?"
+        )
+        
+        if user_responded:
+            print("[Agent] User accepted recommendations")
+            state.continue_workflow = True
+    else:
+        print(f"[Agent] Neutral/positive emotion: {emotion}")
+
+    return {"continue_workflow": state.continue_workflow}
 
 
 def parse_llm_response(text):
@@ -198,13 +266,9 @@ def extract_json_from_text(text):
         return None
     
 def recommendation_agent(state):
-    if not state.detected_task or "No Need to Detect Task" in state.detected_task:
-        print("[Agent] No task detected – skipping recommendation.")
-        return {"recommendation": ["No action needed"], "recommendation_options": []}
-
     emotion = state.average_emotion
-    task = state.detected_task
-    print(f"[Agent] Processing for emotion={emotion!r}, task={task!r}")
+    # task = state.detected_task
+    print(f"[Agent] Processing for emotion={emotion!r}")
 
     negative_emotions = ["Angry", "Sad", "Fear", "Disgust", "Stress", "Boring"]
     if emotion not in negative_emotions:
@@ -219,21 +283,62 @@ def recommendation_agent(state):
     available_apps = get_apps(conn)
     print("[Agent] Available apps:", available_apps)
     prompt = f"""
-            User feels {emotion} while working on: {task}.
-            Looking for 3 four-word mood-improvement suggestions.
+            You are a recommendation engine.
 
-            Installed apps (category|name|path):
+            Context:
+            - User feels: "{emotion}"
+            - Available installed apps (format: category | name | path):
             {available_apps!r}
 
-            Return ONLY valid JSON. No text, no notes. Output must be an array of 3 objects:
-            - recommendation: exactly four words
-            - recommendation_options: array of 2 items each with:
-                app_name (str),
-                app_url (URL or local path),
-                search_query (str, only for web apps),
-                is_local (bool)
-            No duplicates, prefer web apps. All URLs must start with "https://". Each local app sets `is_local: true`.
+            Goal:
+            Generate EXACTLY 3 mood-improvement suggestions, each consisting of:
+            - recommendation: A phrase of exactly FOUR words.
+            - recommendation_options: An array of EXACTLY 2 options per recommendation. Each option must include:
+                - app_name: (string)
+                - app_url: (either a valid HTTPS URL for web apps OR local file path for installed apps)
+                - search_query: (string, required only for web apps)
+                - is_local: (true if app is installed locally, false if web)
+
+            STRICT RULES:
+            1. Output ONLY valid JSON — no extra text, no explanations, no markdown.
+            2. JSON format: An array of 3 objects with keys: recommendation, recommendation_options.
+            3. Each recommendation must have TWO different apps (no duplicates across or within).
+            4. Prefer local apps over web apps if available.
+            5. For web apps:
+            - All URLs must start with "https://".
+            - Use "<search_query>" placeholder in the app_url instead of inserting actual query.
+            - Example web apps are YouTube, Spotify, Online Game (https://poki.com/), MyFlixer (https://myflixerz.to/).
+            6. For local apps:
+            - Use given path as app_url and set is_local = true.
+            - search_query is empty
+            7. Don't use same app in multiple recommendations.
+            8. Each recommendation must be exactly 4 words, meaningful, and mood-impro
+            
+
+            Example of expected structure (do NOT include this in response):
+            [
+            {{
+                "recommendation": "Take a quick break",
+                "recommendation_options": [
+                {{
+                    "app_name": "Spotify",
+                    "app_url": "https://open.spotify.com/search/<search_query>",
+                    "search_query": "relaxing music",
+                    "is_local": false
+                }},
+                {{
+                    "app_name": "KMPlayer",
+                    "app_url": "C:\\\\Program Files\\\\KMPlayer 64X\\\\KMPlayer.exe",
+                    "search_query": "",
+                    "is_local": true
+                }}
+                ]
+            }}
+            ]
+
+            Now, produce the final JSON output:
             """
+
 
     full_schema = RecommendationList.model_json_schema()
 
@@ -290,7 +395,7 @@ def recommendation_agent(state):
             }
 
         res = requests.post(
-             "https://fa7a43f295fa.ngrok-free.app/api/generate",  # Use local endpoint
+             "https://d53cb0fd37cb.ngrok-free.app/api/generate",  # Use local endpoint
             headers={"Content-Type": "application/json"},
             json={
                 "model": "qwen3:4b",
@@ -307,9 +412,11 @@ def recommendation_agent(state):
             print(f"[Agent] API returned status {res.status_code}: {res.text[:200]}")
             return {"recommendation": ["No action needed"], "recommendation_options": []}
 
-        # raw_content = res.json()["choices"][0]["message"]["content"]
         raw_content = res.json()["response"]
         print("Raw Response Content:", raw_content)
+        if not raw_content:
+            print("[Agent] No recommendations found in response.")
+            return {"recommendation": ["No action needed"], "recommendation_options": []}
 
         try:
             parsed_data = json.loads(raw_content) if isinstance(raw_content, str) else raw_content
@@ -380,31 +487,133 @@ def send_blocking_message(title, message):
     MB_OK = 0x0
     ctypes.windll.user32.MessageBoxW(0, message, title, MB_OK)
 
+# def task_execution_agent(state):
+#     recommended_output = state.recommendation
+#     recommended_options = state.recommendation_options
+    
+
+#     print("List of Recommendations in task_execution_agent: ", recommended_output)
+#     if "No action needed" not in recommended_output:
+
+#         chosen_recommendation = send_notification("Recommendations by EMOFI", recommended_output,recommended_options)
+#         print("Chosen recommendation: ", chosen_recommendation)
+#         if chosen_recommendation:
+#             print("Opening recommendations...")
+#             is_opened = open_recommendations(chosen_recommendation)
+#             state.executed = True
+#             return {
+#                     "executed": True,
+#                 }
+
 def task_execution_agent(state):
     recommended_output = state.recommendation
     recommended_options = state.recommendation_options
     
-    print("List of Recommendations in task_execution_agent: ", recommended_output)
-    if "No action needed" not in recommended_output:
-        chosen_recommendation = send_notification("Recommendations by EMOFI", recommended_output,recommended_options)
-        print("Chosen recommendation: ", chosen_recommendation)
-        if chosen_recommendation:
-            print("Opening recommendations...")
-            open_recommendations(chosen_recommendation)
-            return {
-                    "executed": True,
-                }
-                    
+    # Ensure we have recommendations to process
+    if not recommended_output or "No action needed" in recommended_output:
+        return {"executed": False}
+        
+    chosen_recommendation = send_notification(
+        "Recommendations by EMOFI", 
+        recommended_output,
+        recommended_options
+    )
+    
+    # Handle case where user didn't select anything
+    if not chosen_recommendation:
+        return {"executed": False}
+        
+    # Get open results safely
+    result = open_recommendations(chosen_recommendation)
+    if not result:
+        return {"executed": False}
+        
+    is_opened, app_handle, app_type = result
+    print("Result from open_recommendations:", is_opened, app_handle, app_type)
+    
+    # Update state only if app was opened
+    if is_opened:
+        return {
+            "executed": True,
+            "open_app_handle": app_handle,
+            "app_type": app_type,
+            "continue_waiting": True,
+            "wait_start_time": time.time()  # Record start time
+        }
+    
+    return {"executed": False}
+
+
+import psutil
+
+def wait_for_close_agent(state):
+    MAX_WAIT_SECONDS = 300  # 5 minute timeout
+    
+    # Check if we should stop waiting
+    if not state.continue_waiting or not state.open_app_handle:
+        return {"continue_waiting": False}
+    
+    # Check timeout
+    elapsed = time.time() - state.wait_start_time
+    if elapsed > MAX_WAIT_SECONDS:
+        print(f"[Agent] Wait timeout after {MAX_WAIT_SECONDS} seconds")
+        return {
+            "continue_waiting": False,
+            "open_app_handle": None,
+            "app_type": None
+        }
+        
+    # Check if app is closed
+    app_closed = False
+    
+    if state.app_type == 'local':
+        try:
+            process = psutil.Process(state.open_app_handle)
+            app_closed = not process.is_running()
+        except psutil.NoSuchProcess:
+            app_closed = True
+            
+    elif state.app_type == 'web':
+        try:
+            # This will throw if browser closed
+            state.open_app_handle.current_url
+        except Exception:
+            app_closed = True
+    
+    # Update waiting status
+    if app_closed:
+        print("[Agent] Detected app closure")
+        return {
+            "continue_waiting": False,
+            "open_app_handle": None,
+            "app_type": None
+        }
+    
+    # Wait before checking again
+    time.sleep(5)  # Increased sleep to reduce recursion
+    print(f"[Agent] Still waiting for app to close ({int(elapsed)}s elapsed)")
+    return {"continue_waiting": True}
+
+# def task_exit_agent(state):
+#     task_executed = True
+#     if not state.executed:
+#         return {"executed": False, "action_time_start": None}
+#     print("Thread is running")
+#     while task_executed:
+#         time.sleep(50)
+#         task_executed = False
+#     print("Thread is closed")
+#     return {"executed": False, "action_time_start": None}
+
 def task_exit_agent(state):
-    task_executed = True
-    if not state.executed:
-        return {"executed": False, "action_time_start": None}
-    print("Thread is running")
-    while task_executed:
-        time.sleep(10)
-        task_executed = False
-    print("Thread is closed")
-    return {"executed": False, "action_time_start": None}
+    # Reset tracking flags
+    return {
+        "executed": False,
+        "action_time_start": None,
+        "open_app_handle": None,
+        "app_type": None,
+        "continue_waiting": None
+    }
 
 
 # def recommendation_agent(state):
@@ -495,3 +704,60 @@ def task_exit_agent(state):
 #     # This line runs only after user presses OK in the message box
 #     execute_task(recommendation)
 #     return {"executed": True}
+
+
+def task_detection_agent(state):
+    try:
+        if state.average_emotion == "Neutral" or state.average_emotion == "Happy" or state.average_emotion == "Surprise":
+            print("[Agent] No task detection needed for neutral emotion.")
+            return {"detected_task": "No Need to Detect Task"}
+        # Capture screenshot as a base64 string (possibly with prefix)
+        screenshot = capture_desktop()
+        if not screenshot:
+            raise ValueError("Failed to capture screenshot")
+        # Remove data URI prefix if present
+        if screenshot.startswith('data:image'):
+            screenshot = screenshot.split(',')[1]
+
+        # Validate base64 string (optional, for debugging)
+        try:
+            base64.b64decode(screenshot)
+        except Exception as decode_err:
+            raise ValueError(f"Invalid base64 screenshot: {decode_err}")
+
+        # Send the raw base64 string (no prefix) to Ollama
+        # response = ollama.generate(
+        #     model="llava:7b",
+        #     prompt="Describe user's current activity. Focus on software and tasks.",
+        #     images=[screenshot]
+        # )
+        headers = {
+            "Connection": "close",  # Disable keep-alive
+            "Content-Type": "application/json"
+        }
+        response = requests.post(
+            "https://d53cb0fd37cb.ngrok-free.app/api/generate",
+            headers=headers,
+            json={
+                "model": "llava:7b",
+                "prompt": "Describe user's current activity. Focus on software and tasks.",
+                "images": [screenshot],
+                "stream": False
+            }
+        )
+
+        # Handle HTTP errors
+        if response.status_code != 200:
+            print(f"API error ({response.status_code}): {response.text[:100]}...")
+            return {"detected_task": "unknown"}
+
+        # Parse JSON response
+        response_data = response.json()
+        detected_task = response_data.get('response', '').strip()
+        state.detected_task = detected_task
+        print(f"Detected task: {detected_task}")
+        return {"detected_task": detected_task}
+
+    except Exception as e:
+        print(f"Error detecting task: {str(e)}")
+        return {"detected_task": "unknown"}
